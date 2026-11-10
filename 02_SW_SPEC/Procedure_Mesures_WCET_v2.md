@@ -50,8 +50,8 @@ BCET  ≤  temps observés  ≤  max observé (MOET)  ≤  WCET réel  ≤  born
 ## 3. Matériel et outils
 
 - Serre complète câblée, ESP32 relié en USB.
-- Un terminal série **qui enregistre dans un fichier**, réglé à 115200 bauds : PuTTY (*Session → Logging → All session output*) ou CoolTerm. Le moniteur série de l'Arduino IDE convient aussi, mais il faut copier-coller le texte.
-- *Optionnel :* oscilloscope ou analyseur logique (un clone 8 voies à environ 10 € avec PulseView suffit) sur les GPIO de trace : **4** (T_ACQ), **5** (T_REG), **13** (T_IHM), **14** (T_LCD), **27** (T_DIAG), plus une voie sur la broche d'un bouton.
+- Le **moniteur série de l'Arduino IDE** (mode d'emploi au §4.1).
+- Un éditeur de texte (Bloc-notes) pour coller les rapports.
 - Dossier de rangement des traces brutes : `GREENHOUSE_V2/05_MESURES/` (un fichier `.txt` par essai).
 
 ## 4. Configuration (fichier `rt_trace.h`)
@@ -59,15 +59,28 @@ BCET  ≤  temps observés  ≤  max observé (MOET)  ≤  WCET réel  ≤  born
 | Paramètre | Rôle | Défaut (opérationnel) |
 |---|---|---|
 | `RT_TRACE` | Active l'instrumentation et le rapport toutes les 10 s | 0 |
-| `RT_TRACE_GPIO` | Chaque tâche met son GPIO à 1 pendant son exécution | 0 |
-| `RT_STIMULUS` | Tâche `T_STIM` (priorité 1) qui injecte un appui PB1 toutes les 250 ms | 0 |
+| `RT_TRACE_GPIO` | Chaque tâche met son GPIO à 1 pendant son exécution (non utilisé : pas d'essai à l'oscilloscope) | 0 |
+| `RT_STIMULUS` | Tâche `T_STIM` (priorité 1) qui injecte un appui PB1 toutes les 100 ms (`RT_STIMULUS_MS`) | 0 |
 
-**Lecture du rapport.** Il est imprimé par `T_DIAG` toutes les 10 s. Les statistiques sont **cumulées depuis le démarrage** : pour chaque essai, on relève le **dernier** rapport. On appuie sur **EN** (reset) entre deux essais pour remettre les compteurs à zéro.
+### 4.1 Utilisation du moniteur série de l'Arduino IDE
+
+Le moniteur série de l'Arduino IDE **ne sait pas enregistrer dans un fichier**, et on ne peut copier que ce qui est visible à l'écran. Ce n'est pas gênant ici : les statistiques sont **cumulées depuis le démarrage**, donc seul le **dernier rapport** de chaque essai compte, et il tient sur une douzaine de lignes.
+
+1. Ouvrir le moniteur : *Outils → Moniteur série* (`Ctrl + Maj + M`), et régler la vitesse sur **115200 bauds** (liste déroulante en haut à droite).
+2. Appuyer sur **EN** (reset) de l'ESP32 pour démarrer l'essai : les compteurs repartent de zéro. Le message « BONJOUR LUCAS / GREENH V2 RTOS » reste affiché 2 s sur le LCD.
+3. **Pas besoin de chronomètre.** Toutes les 10 s, `T_DIAG` imprime un rapport qui commence par `===== RT_TRACE @ xxx ms`, où `xxx` est le temps écoulé depuis le reset. Il sert d'horloge pour la conduite des essais.
+4. En fin d'essai, dès que le rapport **`@ 120000 ms`** (2 min) est affiché :
+   - désactiver le **défilement automatique** (icône *Toggle Autoscroll*, en haut à droite), sinon la sélection saute toutes les 10 s ;
+   - sélectionner à la souris de la ligne `===== RT_TRACE @ 120000 ms =====` jusqu'à la ligne `Pile libre min ...`, puis `Ctrl + C` ;
+   - coller dans le Bloc-notes et enregistrer sous `05_MESURES/<nom de l'essai>.txt`.
+5. Réactiver le défilement automatique avant l'essai suivant.
+
+### 4.2 Lecture du rapport
 
 ```
-===== RT_TRACE @ 600000 ms =====
+===== RT_TRACE @ 120000 ms =====
 Tache          N  Cmin_us  Cmoy_us  Cmax_us   Gigue_us
-T_ACQ       6000      ...      ...      ...        ...   <- Gigue = écart max à la période de 100 ms
+T_ACQ       1200      ...      ...      ...        ...   <- Gigue = écart max à la période de 100 ms
 ...
 Latence appui->prise en compte max : ... us
 Latence appui->ecran a jour max    : ... us
@@ -79,43 +92,49 @@ Pile libre min (o) : ACQ ... | REG ... | ...              <- marge de pile resta
 
 ## 5. Essais
 
-> Avant chaque essai : modifier la configuration, téléverser, ouvrir le terminal avec enregistrement, appuyer sur EN.
+> **Déroulé type d'un essai :** modifier la configuration → téléverser → ouvrir le moniteur série (115200) → appuyer sur EN → conduire l'essai en suivant l'horodatage `@ ... ms` des rapports → copier le rapport `@ 120000 ms` (§4.1).
 
-### E1 – Fonctionnement nominal (≈ 10 min)
+| Essai | Config (`rt_trace.h` / `greenhv2.ino`) | Durée | Rapport à copier | Fichier |
+|---|---|---|---|---|
+| E1 nominal | `RT_TRACE 1`, `RT_STIMULUS 0` | 2 min | `@ 120000 ms` | `E1_nominal.txt` |
+| E2 pire cas | `RT_TRACE 1`, `RT_STIMULUS 1` | 2 min | `@ 120000 ms` | `E2_pire_cas.txt` |
+| E3 boutons | `RT_TRACE 1`, `RT_STIMULUS 0` | 2 min | `@ 120000 ms` | `E3_latences.txt` |
+| E4 isolation LCD | comme E2 + `PRIO_LCD 7` | 2 min | `@ 120000 ms` | `E4_isolation_LCD.txt` |
+| E6 chien de garde | `RT_TRACE 0` + code de test | ≈ 30 s | message `task_wdt` | `E6_watchdog.txt` |
+
+Total : environ 10 min d'essais, soit une vingtaine de minutes en comptant les téléversements.
+
+### E1 – Fonctionnement nominal (2 min)
 - **Config :** `RT_TRACE 1`, `RT_STIMULUS 0`.
-- **Conduite :** rester sur la page 1, ne rien toucher pendant 10 min.
-- **Objectif :** ≥ 1000 activations pour `T_ACQ` (100 s suffisent), `T_REG`, `T_DIAG` et `T_LCD` (500 ms × 1000 ≈ 8,3 min). On obtient le comportement « au repos » : peu de redessins, gigue de base.
+- **Conduite :** rester sur la page 1 et ne rien toucher jusqu'au rapport `@ 120000 ms` (ou plus) : l'horodatage du rapport sert de chronomètre.
+- **Objectif :** ≥ 1000 activations pour `T_ACQ` et `T_REG` (environ 1200 en 2 min). On obtient le comportement « au repos » : peu de redessins, gigue de base. `T_LCD` et `T_DIAG` n'ont qu'environ 240 activations ici : leurs 1000 activations au pire cas sont obtenues en E2 et E4.
 - **Fichier :** `E1_nominal.txt`.
 
-### E2 – Pire cas IHM / LCD / régulation (≈ 10 min)
+### E2 – Pire cas IHM / LCD / régulation (2 min)
 - **Config :** `RT_TRACE 1`, `RT_STIMULUS 1`.
-- **Conduite :** le banc de stimulation fait défiler les pages toutes les 250 ms : chaque appui provoque un redessin complet du LCD, et `T_REG` est réveillée à l'entrée et à la sortie de la page 4. Pendant ce temps :
-  - à t ≈ 2 min, débrancher la sonde de température 30 s, puis la rebrancher : diagnostic, ventilateur forcé ;
-  - à t ≈ 4 min, débrancher la sonde d'humidité 30 s, puis la rebrancher ;
-  - à t ≈ 6 min, souffler de l'air chaud sur le TMP235 ou le serrer dans la main pour faire commuter le ventilateur.
-- **Objectif :** ≥ 1000 activations de `T_IHM` et de `T_LCD` (≈ 4 min), en faisant passer le code par tous ses chemins.
+- **Conduite :** le banc de stimulation fait défiler les pages toutes les 100 ms : chaque appui provoque un redessin complet du LCD, et `T_REG` est réveillée à l'entrée et à la sortie de la page 4. Pendant ce temps :
+  - vers `@ 10000 ms`, débrancher la sonde de température 20 s (le défaut se confirme en 15 s), puis la rebrancher : diagnostic, ventilateur forcé ;
+  - vers `@ 40000 ms`, débrancher la sonde d'humidité 20 s, puis la rebrancher ;
+  - vers `@ 70000 ms`, serrer le TMP235 dans la main pour faire commuter le ventilateur ;
+  - copier le rapport `@ 120000 ms`.
+- **Objectif :** ≥ 1000 activations de `T_IHM` et de `T_LCD` (environ 1200 redessins complets en 2 min), en faisant passer le code par tous ses chemins. `T_DIAG` (environ 240 activations par essai) a un code court à chemin unique et ne pèse que 0,02 % de la charge : un échantillon plus réduit suffit, ce qui est justifié dans le rapport.
 - **Fichier :** `E2_pire_cas.txt`.
 
-### E3 – Latence réelle des boutons, interruption comprise (≈ 5 min)
+### E3 – Latence réelle des boutons, interruption comprise (2 min)
 - **Config :** `RT_TRACE 1`, `RT_STIMULUS 0`.
-- **Conduite :** environ 50 appuis sur chaque bouton, sur toutes les pages, dont **20 appuis rapides sur PB1** : les pages changent pendant que le LCD redessine encore. C'est le pire cas pour SR-GH-023.
+- **Conduite :** pendant les 2 min, environ 30 appuis sur chaque bouton, sur toutes les pages, dont **20 appuis rapides sur PB1** : les pages changent pendant que le LCD redessine encore. C'est le pire cas pour SR-GH-023. Copier le rapport `@ 120000 ms`.
 - **Objectif :** latences appui → prise en compte et appui → écran à jour, mesurées depuis l'interruption. Le banc E2 ne mesure, lui, que depuis l'injection dans la file.
 - **Fichier :** `E3_latences.txt`.
 
-### E4 – Isolation du C de T_LCD, et démonstration de l'intérêt des priorités (≈ 5 min)
+### E4 – Isolation du C de T_LCD, et démonstration de l'intérêt des priorités (2 min)
 - **Config :** comme E2, et dans `greenhv2.ino` : `#define PRIO_LCD 7` (au-dessus de `T_ACQ`). **Essai de laboratoire uniquement : remettre 3 ensuite.**
+- **Conduite :** ne rien toucher (le banc de stimulation fait défiler les pages), copier le rapport `@ 120000 ms`.
 - **Objectif 1 :** `T_LCD` n'est plus préemptée par personne, donc sa durée mesurée vaut son vrai **C_LCD**. L'écart avec E2 donne l'interférence subie.
 - **Objectif 2, pour l'oral :** la **gigue de `T_ACQ` doit exploser** jusqu'à environ la durée d'un redessin, soit quelques dizaines de ms, et ne plus respecter SR-GH-021. C'est la preuve par la mesure que l'ordre des priorités (Deadline Monotonic) est nécessaire.
 - **Fichier :** `E4_isolation_LCD.txt`.
 
-### E5 – Contrôle à l'oscilloscope (optionnel, recommandé)
-- **Config :** `RT_TRACE 1`, `RT_TRACE_GPIO 1`, `RT_STIMULUS 1`.
-- **Mesures :**
-  - largeur d'impulsion de chaque GPIO (min, max, en persistance) à comparer aux valeurs logicielles : l'écart donne le coût de l'instrumentation ;
-  - période et gigue de la broche 4 (`T_ACQ`) ;
-  - broche d'un bouton (front descendant) jusqu'à la broche 13 (`T_IHM`) : latence matérielle complète ;
-  - chronogramme réel du cœur 1, à mettre en face du chronogramme théorique de la conception (§6.3). C'est une capture parfaite pour le rapport.
-- **Fichier :** captures d'écran `E5_*.png`.
+### E5 – Contrôle à l'oscilloscope
+*Non retenu (décision du 10/11/2026) : l'instrumentation logicielle suffit pour l'approche WCET du projet.*
 
 ### E6 – Chien de garde (SR-GH-030)
 - **Config :** `RT_TRACE 0`. Dans `T_DIAG`, ajouter **temporairement**, juste avant `vTaskDelayUntil` :
@@ -123,7 +142,8 @@ Pile libre min (o) : ACQ ... | REG ... | ...              <- marge de pile resta
   static int essai_wdt = 0;
   if (++essai_wdt == 20) { vTaskDelay(pdMS_TO_TICKS(8000)); }   // TEST WDT : blocage 8 s après ~10 s
   ```
-- **Attendu :** environ 15 s après le démarrage, le moniteur série affiche `task_wdt: Task watchdog got triggered` en citant `T_DIAG`, puis l'ESP32 redémarre.
+- **Attendu :** environ 15 s après le reset (2 s de message de démarrage, environ 10 s de fonctionnement, puis 5 s de blocage détecté), le moniteur série affiche `task_wdt: Task watchdog got triggered` en citant `T_DIAG`, puis l'ESP32 redémarre. Ce message est affiché par ESP-IDF même avec `RT_TRACE 0`.
+- **Conduite :** copier les lignes du message `task_wdt` et du redémarrage (moniteur série, §4.1).
 - **Retirer le code de test ensuite.**
 - **Fichier :** `E6_watchdog.txt`.
 
@@ -138,6 +158,6 @@ Pile libre min (o) : ACQ ... | REG ... | ...              <- marge de pile resta
 
 ## 7. Précautions
 
-- **Instrumentation non intrusive :** avec `RT_TRACE 0`, toutes les fonctions de trace sont vides (aucun surcoût en exploitation). Avec `RT_TRACE 1`, le coût est d'environ 2 lectures d'horloge par activation (≈ 1 µs), à vérifier en E5.
+- **Instrumentation non intrusive :** avec `RT_TRACE 0`, toutes les fonctions de trace sont vides (aucun surcoût en exploitation). Avec `RT_TRACE 1`, le coût est d'environ 2 lectures d'horloge par activation (≈ 1 µs), négligeable devant les durées mesurées.
 - **Le rapport série est imprimé par `T_DIAG` après sa mesure** : il ne fausse pas son C. Il ajoute en revanche de l'activité UART, qui fait partie des interférences réalistes.
 - **Toujours remettre en configuration opérationnelle** après les essais : `RT_TRACE 0`, `RT_STIMULUS 0`, `PRIO_LCD 3`, code de test du chien de garde retiré. Commiter les traces dans `05_MESURES/`.

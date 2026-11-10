@@ -63,6 +63,7 @@
 
 /* ================== IHM ================== */
 #define LCD_REFRESH_MS   500   // Rafraîchissement LCD périodique : 500 ms = confort visuel (SR-GH-024)
+#define SPLASH_MS        2000  // Durée d'affichage du message de démarrage (lisible à l'oeil nu)
 #define NB_PAGES         5
 #define PAGE_MANUEL      4
 #define SEUIL_T_MAX      51
@@ -420,6 +421,12 @@ static void T_LCD(void *pvParameters)
   (void)pvParameters;
   esp_task_wdt_add(NULL);
 
+  // Message de démarrage affiché par setup() : on attend SPLASH_MS avant le 1er redessin.
+  // Seule T_LCD attend : l'acquisition et la régulation démarrent immédiatement (pas de delay() bloquant dans setup).
+  // vTaskDelay rend le processeur aux autres tâches ; 2 s < 5 s du chien de garde.
+  vTaskDelay(pdMS_TO_TICKS(SPLASH_MS));
+  xSemaphoreGive(sem_lcd);      // 1er redessin immédiatement à la fin du message (sans attendre 500 ms)
+
   static lcd_state_t lcd_prev = {};
   static lcd_state_t lcd_curr = {};
 
@@ -539,6 +546,12 @@ static void T_DIAG(void *pvParameters)
 #endif
 
     esp_task_wdt_reset();
+
+    ////////////////////-----------------Test E6 a commenter en operationel-----------------////////////////////
+    /*static int essai_wdt = 0;
+    if (++essai_wdt == 20) { vTaskDelay(pdMS_TO_TICKS(8000)); }   // TEST WDT : blocage 8 s après ~10 s*/
+    ////////////////////-----------------Test E6 a commenter en operationel-----------------////////////////////
+
     vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(DIAG_PERIOD_MS));
   }
 }

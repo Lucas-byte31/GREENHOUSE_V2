@@ -25,7 +25,7 @@
 #define RT_TRACE_GPIO       0       // 1 = un GPIO passe à 1 pendant l'exécution de chaque tâche
 #define RT_TRACE_REPORT_MS  10000   // Période d'impression du rapport (par T_DIAG)
 #define RT_STIMULUS         0       // 1 = banc de stimulation : la tâche T_STIM injecte des appuis PB1
-#define RT_STIMULUS_MS      250     //     toutes les 250 ms (changement de page -> redessin complet du LCD)
+#define RT_STIMULUS_MS      100     //     toutes les 100 ms (changement de page -> redessin complet du LCD)
 
 // Identifiants des tâches instrumentées
 typedef enum
