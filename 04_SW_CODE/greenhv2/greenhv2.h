@@ -4,6 +4,7 @@
  * Définitions communes du projet GREENHOUSE V2 (équivalent du main.h de la V1)
  * - Mapping des GPIO de l'ESP32 (cf. Schema de cablage.pptx V2)
  * - Structure de l'état du LCD partagée entre le séquenceur et le lcd_page_manager
+ * - Type des événements de la file q_reg (V2.1 FreeRTOS)
  *
  *  Created on: Nov 4, 2026
  *      Author: lucas
@@ -52,5 +53,22 @@ typedef struct
     bool pump_on;
     bool fan_on;
 } lcd_state_t;
+
+/* ================== EVENEMENTS DE LA REGULATION ================== */
+// Message déposé dans la file q_reg pour réveiller la tâche T_REG
+typedef enum
+{
+    EVT_MESURE = 0,     // Nouvelle mesure publiée par T_ACQ (toutes les 100 ms)
+    EVT_COMMANDE        // Changement de page ou commande manuelle par T_IHM
+} reg_event_type_t;
+
+typedef struct
+{
+    reg_event_type_t type;
+    float temperature;  // Valeurs valides uniquement pour EVT_MESURE
+    float humidity;
+    int   t_filt;
+    int   h_filt;
+} reg_event_t;
 
 #endif /* GREENHV2_H */

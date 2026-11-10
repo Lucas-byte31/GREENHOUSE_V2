@@ -15,6 +15,7 @@
  */
 
 #include "capteurs.h"
+#include <Arduino.h>
 
 
 // Convertit la tension mesurée en température Celsius.
@@ -64,4 +65,21 @@ float CAPTEURS_ComputeHumidity(uint32_t voltage_mv, float air_mv, float water_mv
     if (H > 100.0f) H = 100.0f;
 
     return H;
+}
+
+
+/* Lecture d un canal ADC1 par polling, retourne la tension en mV */
+// Pas besoin d'interruption pour l'ADC car les mesures sont lentes (température et humidité)
+// analogReadMilliVolts() applique la courbe d'étalonnage usine (eFuse) de l'ADC ESP32
+// Sur-échantillonnage : moyenne de n_samples conversions pour réduire le bruit de l'ADC
+uint32_t CAPTEURS_ReadMilliVolts(uint8_t pin, int n_samples)
+{
+    if (n_samples < 1) n_samples = 1;
+
+    uint32_t sum = 0;
+    for (int i = 0; i < n_samples; i++)
+    {
+        sum += analogReadMilliVolts(pin);
+    }
+    return sum / (uint32_t)n_samples;   // tension moyenne en mV
 }

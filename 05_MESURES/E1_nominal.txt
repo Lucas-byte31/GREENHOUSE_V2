@@ -1,0 +1,11 @@
+===== RT_TRACE @ 120128 ms =====
+Tache          N  Cmin_us  Cmoy_us  Cmax_us   Gigue_us
+T_ACQ       1201     1344     1347     1650        217
+T_REG       1201       30       33       70          0
+T_IHM          0        0        0        0          0
+T_LCD        305        6    10736    28816          0
+T_DIAG       241       12       12       29          0
+Latence appui->prise en compte max : 0 us
+Latence appui->ecran a jour max    : 0 us
+File pleine : 0 | Mutex timeout : 0
+Pile libre min (o) : ACQ 2104 | REG 2368 | IHM 2408 | LCD 2476 | DIAG 2032

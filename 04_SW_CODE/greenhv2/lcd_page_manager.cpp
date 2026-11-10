@@ -7,10 +7,10 @@
  *  Created on: Dec 30, 2025
  *      Author: lucas
  *  Migrated on: Nov 4, 2026 (logique inchangée, seul le driver lcd est passé en I2C)
+ *  V2.1 FreeRTOS : appelé uniquement par la tâche T_LCD (gardien de l'écran)
  */
 #include "lcd_page_manager.h"
 #include "lcd.h"
-#include "error_handler.h"
 #include <string.h>
 
 /* -------------------------------------------------------------------------- */
@@ -52,7 +52,9 @@ void lcd_page_1(lcd_state_t *curr, lcd_state_t *prev)
     lcd_show_carac('%');
 
     	// Print de l'etat du systeme OK ou KO affiché sur la page 1 uniquement
-    	if (error_handler_has_error() == 0)
+    	// V2 : on lit le code erreur de l'instantané (curr) et non plus l'error_handler directement,
+    	// qui appartient à la tâche T_DIAG (pas d'accès concurrent hors données partagées)
+    	if (curr->code_erreur == 0)
     	{
     	lcd_position_cursor(15, 0);
     	lcd_show_carac('O'); // Symbole O

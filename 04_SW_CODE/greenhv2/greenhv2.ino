@@ -2,15 +2,24 @@
  * greenhv2.ino
  *
  * PROJET GREENHOUSE V2 - Système de régulation d'une serre
- * Etape 3 : migration STM32 (STM32CubeIDE / HAL) -> ESP32 (Arduino IDE)
+ * Etape 5 : version temps réel FreeRTOS (V2.1 - branche feature/freertos)
  *
- * Ce fichier remplace le main.c de la V1 :
- *  - setup() : séquence d'initialisation (équivalent MX_xxx_Init + USER CODE 2)
- *  - loop()  : boucle principale (équivalent du while(1)), logique strictement identique à la V1
+ * Ce fichier séquence le système :
+ *  - setup() : initialise le matériel, crée les objets de synchronisation puis les 5 tâches
+ *  - loop()  : la tâche Arduino loopTask n'est plus utilisée, elle se supprime
+ *  - corps des 5 tâches : ils ne font que séquencer les appels aux composants
  *
- * Remarque : sur ESP32, loop() est déjà exécutée dans une tâche FreeRTOS (loopTask, cœur 1).
- * Cette version reste volontairement une super-boucle « iso-V1 » qui sert de référence
- * de non-régression (SR-GH-016) avant le découpage en tâches temps réel.
+ * Architecture (cf. 02_SW_SPEC/Conception_TR_v2.md) - toutes les tâches sur le cœur 1 :
+ *
+ *   Tâche    Prio  Activation                         Rôle
+ *   T_ACQ     6    périodique 100 ms                  acquisition + filtrage -> q_reg
+ *   T_REG     5    événement q_reg                    régulation, seule à piloter les actionneurs
+ *   T_IHM     4    événement q_boutons (ISR)          traitement des appuis selon la page
+ *   T_LCD     3    sem_lcd ou 500 ms                  seule à piloter l'écran
+ *   T_DIAG    2    périodique 500 ms                  diagnostic (error_handler)
+ *
+ *   Synchronisation : mutex mtx_data (shared_data), sémaphore binaire sem_lcd,
+ *                     files q_boutons (ISR -> T_IHM) et q_reg (T_ACQ / T_IHM -> T_REG)
  *
  *  Created on: Nov 4, 2026
  *      Author: lucas
@@ -24,82 +33,95 @@
 #include "lcd_page_manager.h"
 #include "filter.h"
 #include "error_handler.h"
+#include "shared_data.h"
+#include "buttons.h"
+#include "regulation.h"
+#include "rt_trace.h"
 #include <stdlib.h>
-
-/* ================== DEBUG ================== */
-// Pour debug sur le moniteur série (115200 bauds) -- pas besoin en opérationnel
-// Utile pour l'étalonnage des capteurs (affiche les tensions brutes en mV)
-#define GREENHV2_DEBUG       0
-#define DEBUG_PERIOD_MS      1000
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "esp_task_wdt.h"
+#include "esp_timer.h"
 
 /* ================== ETALONNAGE CAPTEURS ================== */
-#define V_OFFSET_MV   0.0f     // offset TMP235 (mV) - V1 : 130 mV sur STM32, à remesurer sur ESP32
+#define V_OFFSET_MV   0.0f     // offset TMP235 (mV) - nul sur ESP32 (ADC étalonné usine via analogReadMilliVolts)
 
-// Calibration humidité Grove 101020614 (mV) - à remesurer sur la cible ESP32
-// Valeurs de départ = valeurs V1 converties en mV (2675 pts et 1780 pts sur 12 bits / 3,3 V)
-//#define AIR_VALUE_MV    2156.0f  // mesure en air sec - valeur sur STM32
-//#define WATER_VALUE_MV  1434.0f  // mesure dans l'eau - valeur sur STM32
+// Calibration humidité Grove 101020614 (mV)
 #define AIR_VALUE_MV    2156.0f  // mesure en air sec - valeur sur ESP32
 #define WATER_VALUE_MV  1434.0f  // mesure dans l'eau - valeur sur ESP32
 
+/* ================== PARAMETRES PAR DEFAUT ================== */
+#define SEUIL_TEMPERATURE_DEFAUT  25   // °C
+#define SEUIL_HUMIDITE_DEFAUT     5    // % (V1 : 18 %, abaissé à 5 % en V2 - SR-GH-007)
+
 /* ================== ACQUISITION ================== */
-// V2 : l'ADC de l'ESP32 est plus bruité que celui du STM32 (± 40 mV observés sur le capteur d'humidité)
-// et la boucle tourne beaucoup plus vite qu'en V1 : le filtre sur 8 échantillons ne couvrait
-// plus que quelques ms. On fixe donc la période d'acquisition (anticipation SR-GH-021)
-// et on moyenne plusieurs conversions ADC à chaque acquisition (sur-échantillonnage).
-#define ACQ_PERIOD_MS    100   // Période d'acquisition : 8 échantillons x 100 ms = fenêtre de 0,8 s
+#define ACQ_PERIOD_MS    100   // Période d'acquisition (SR-GH-021) : 8 échantillons x 100 ms = fenêtre de 0,8 s
 #define ADC_OVERSAMPLING 16    // Nombre de conversions moyennées par lecture (bruit divisé par ~4)
+#define FILTER_SIZE      8     // Moyenne glissante sur 8 échantillons
 
 /* ================== IHM ================== */
-#define DEBOUNCE_MS      200   // Anti-rebond logiciel des boutons (V1 : 200 ms)
-#define LCD_REFRESH_MS   500   // Rafraîchissement LCD : 500 ms = confort visuel
+#define LCD_REFRESH_MS   500   // Rafraîchissement LCD périodique : 500 ms = confort visuel (SR-GH-024)
+#define SPLASH_MS        2000  // Durée d'affichage du message de démarrage (lisible à l'oeil nu)
+#define NB_PAGES         5
+#define PAGE_MANUEL      4
+#define SEUIL_T_MAX      51
+#define SEUIL_H_MAX      100
 
 #define TEMP_DEADBAND 1 // 1 °C de DEADBAND
 #define HUM_DEADBAND  2 // 2 % de DEADBAND
 
+/* ================== DIAGNOSTIC ================== */
+#define DIAG_PERIOD_MS   500
 
-//Flags d'interruption pour les boutons poussoir : mis à TRUE par IT GPIO
-// Mis à FALSE par la boucle principale
-volatile bool PB1_pressed = false;   // Flag PB1 - Bouton rouge - navigation dans les menus
-volatile bool PB2_pressed = false;   // Flag PB2 - Bouton blanc - Incrémentation consigne ou Forcage manuel
-volatile bool PB3_pressed = false;   // Flag PB3 - Bouton vert - Décrémentation consigne ou Forcage manuel
+/* ================== CONFIGURATION FreeRTOS ================== */
+#define RT_CORE          1     // Cœur applicatif (APP_CPU) - un seul cœur utilisé (SR-GH-020)
+
+// Priorités (Deadline Monotonic, cf. Conception_TR_v2 §4) - au-dessus de loopTask/Timer (1) et IDLE (0)
+#define PRIO_ACQ         6
+#define PRIO_REG         5
+#define PRIO_IHM         4
+#define PRIO_LCD         3
+#define PRIO_DIAG        2
+
+// Tailles de pile en octets (à ajuster avec uxTaskGetStackHighWaterMark à l'étape 6)
+#define STACK_ACQ        3072
+#define STACK_REG        3072
+#define STACK_IHM        3072
+#define STACK_LCD        4096
+#define STACK_DIAG       4096
+
+#define REG_QUEUE_LENGTH 4
+
+// Délais max d'attente des tâches événementielles : elles se réveillent toujours
+// à temps pour rafraîchir le chien de garde (jamais portMAX_DELAY)
+#define REG_WAIT_MS      500
+#define IHM_WAIT_MS      1000
+
+// Chien de garde des tâches (SR-GH-030)
+#define WDT_TIMEOUT_MS   5000
 
 
-//--Paramètres de régulation par défaut--//
-static int Var_page = 1; // page affichée au démarrage
-static int seuil_temperature = 25;  // Seuil de température par défaut
-static int seuil_humidite = 5;      // Seuil d'humidité par défaut (V1 : 18 %, abaissé à 5 % en V2 pour la démonstration)
-static int code_erreur = 0; //init du code erreur à 0
-static uint8_t speed = 0;  // Variable pour la vitesse de la pompe (0-100) en %
+/* ================== OBJETS FreeRTOS ================== */
+static QueueHandle_t     q_boutons = NULL;   // File ISR boutons -> T_IHM
+static QueueHandle_t     q_reg     = NULL;   // File d'événements T_ACQ / T_IHM -> T_REG
+static SemaphoreHandle_t sem_lcd   = NULL;   // Sémaphore binaire T_IHM / T_REG / T_DIAG -> T_LCD
 
-//--Calcul de la rampe linéaire à l'approche du seuil d'humidité--//
-// (V2 : x1/y1 renommés car y1() est déjà déclarée par math.h côté Arduino)
-static const float ramp_x1 = 0.55f;  // 0.55*seuil_humidite → speed = 100
-static const float ramp_y1 = 100.0f;
-static const float ramp_x2 = 1.0f;   // 1.0*seuil_humidite → speed = 50
-static const float ramp_y2 = 50.0f;
-// Coefficients m et b de la droite y = mx + b (calculés dans setup)
-static float m = 0.0f;
-static float b = 0.0f;
-
-// Etats LCD courant / précédent
-static lcd_state_t lcd_prev = {};
-static lcd_state_t lcd_curr = {};
-static uint32_t last_lcd_update = 0;
-
-//- Filtrage sur moyenne glissante pour éviter le clear intempestif du LCD --//
-static int t_display = 0; // température affichée
-static int h_display = 0; // humidité affichée
-static moving_avg_filter_t temp_filter;
-static moving_avg_filter_t hum_filter;
+static TaskHandle_t h_acq = NULL, h_reg = NULL, h_ihm = NULL, h_lcd = NULL, h_diag = NULL;
 
 
 /* ================== PROTOTYPES ================== */
-uint32_t ReadADC_Channel(uint8_t pin);
-void IRAM_ATTR PB1_ISR(void);
-void IRAM_ATTR PB2_ISR(void);
-void IRAM_ATTR PB3_ISR(void);
-static void Buttons_Init(void);
+static void T_ACQ(void *pvParameters);
+static void T_REG(void *pvParameters);
+static void T_IHM(void *pvParameters);
+static void T_LCD(void *pvParameters);
+static void T_DIAG(void *pvParameters);
+#if RT_STIMULUS
+static void T_STIM(void *pvParameters);
+#endif
+static void Watchdog_Init(void);
+static void Fatal_Error(const char *msg);
 
 
 /* ======================================================================== */
@@ -107,364 +129,492 @@ static void Buttons_Init(void);
 /* ======================================================================== */
 void setup()
 {
-#if GREENHV2_DEBUG
+#if RT_TRACE
   Serial.begin(115200);
 #endif
+  rt_trace_init();
 
-  // Initialisation des périphériques (équivalent MX_GPIO_Init / MX_ADC1_Init / MX_TIM3_Init)
+  // ===================== Initialisation du matériel =====================
   analogReadResolution(12);   // ADC 12 bits comme en V1 (la lecture se fait en mV)
-  Buttons_Init();
 
   // On initialise le moteur a OFF
   Motor_Init();
   // On initialise la pompe a OFF
-  Pump_Init(); // init de la pompe
-
-  //--Configuration du PWM pour la pompe--//
-  // Calcul des coefficients m et b de la droite y = mx + b
-  m = (ramp_y2 - ramp_y1) / (ramp_x2 - ramp_x1);
-  b = ramp_y1 - m * ramp_x1;
+  Pump_Init();
+  // Coefficients de la rampe PWM
+  Regulation_Init();
 
   // Initialisation LCD
   lcd_init();
   lcd_clear();
-
-  // Affichage
   lcd_position_cursor(0,0);
-  lcd_show_txt("HELLO WORLD");
-
+  lcd_show_txt("BONJOUR LUCAS");
   lcd_position_cursor(0,1);
-  lcd_show_txt("ESP32 GREENH V2");
+  lcd_show_txt("GREENH V2 RTOS");
 
-  //Moyenne glissante sur 8 échantillons pour stabiliser l'affichage sur le LCD
-  filter_init(&temp_filter, 8, seuil_temperature); //init du filtre au seuil_temperature
-  filter_init(&hum_filter, 8, seuil_humidite); //init du filtre au seuil humidite
+  // Init de l'Error Handler (utilisé uniquement par T_DIAG)
+  error_handler_init(SEUIL_TEMPERATURE_DEFAUT, SEUIL_HUMIDITE_DEFAUT);
 
-  // Init de l'Error Handler
-  error_handler_init(seuil_temperature, seuil_humidite); // Init de l'error handler
-}
+  // ===================== Création des objets de synchronisation =====================
+  // Ils doivent exister AVANT les tâches et les interruptions qui les utilisent
+  if (!shared_data_init(SEUIL_TEMPERATURE_DEFAUT, SEUIL_HUMIDITE_DEFAUT)) Fatal_Error("mtx_data");
 
+  q_boutons = xQueueCreate(BUTTONS_QUEUE_LENGTH, sizeof(button_event_t));
+  q_reg     = xQueueCreate(REG_QUEUE_LENGTH, sizeof(reg_event_t));
+  sem_lcd   = xSemaphoreCreateBinary();     // créé "vide" : la 1re prise attend un don
+  if (q_boutons == NULL || q_reg == NULL || sem_lcd == NULL) Fatal_Error("objets RTOS");
 
-/* ======================================================================== */
-/*                         BOUCLE PRINCIPALE (iso-V1)                       */
-/* ======================================================================== */
-void loop()
-{
-  // Connaitre l'instant présent - utilisé dans l'error handler et dans le rafraichissement du LCD
-  uint32_t now = millis();
+  // Boutons : interruptions armées depuis setup() -> servies par le cœur 1
+  Buttons_Init(q_boutons);
 
-  // Grandeurs mesurées : conservées entre deux acquisitions (static)
-  static uint32_t last_acq = 0;
-  static bool first_acq = true;     // force une acquisition dès le 1er passage (pas de régulation sur des mesures à 0)
-  static uint32_t mv_hum = 0, mv_temp = 0;
-  static float humidity = 0.0f, temperature = 0.0f;
-  static int h_int = 0, t_int = 0;
-  static int t_filt = 0, h_filt = 0;
+  Watchdog_Init();
 
-  // ===================== Acquisition périodique (100 ms) =====================
-  if (first_acq || (now - last_acq) >= ACQ_PERIOD_MS)
-  {
-    first_acq = false;
-    last_acq = now;
+  // ===================== Création des tâches, toutes épinglées sur le cœur 1 =====================
+  // Remarque : setup() tourne dans loopTask (prio 1) ; chaque tâche créée, plus prioritaire,
+  // démarre immédiatement. Les objets RTOS étant déjà créés, l'ordre de création est sans risque.
+  xTaskCreatePinnedToCore(T_DIAG, "T_DIAG", STACK_DIAG, NULL, PRIO_DIAG, &h_diag, RT_CORE);
+  xTaskCreatePinnedToCore(T_LCD,  "T_LCD",  STACK_LCD,  NULL, PRIO_LCD,  &h_lcd,  RT_CORE);
+  xTaskCreatePinnedToCore(T_IHM,  "T_IHM",  STACK_IHM,  NULL, PRIO_IHM,  &h_ihm,  RT_CORE);
+  xTaskCreatePinnedToCore(T_REG,  "T_REG",  STACK_REG,  NULL, PRIO_REG,  &h_reg,  RT_CORE);
+  xTaskCreatePinnedToCore(T_ACQ,  "T_ACQ",  STACK_ACQ,  NULL, PRIO_ACQ,  &h_acq,  RT_CORE);
+  if (!h_acq || !h_reg || !h_ihm || !h_lcd || !h_diag) Fatal_Error("creation taches");
 
-    /* ================== HUMIDITE sur Io34 (ADC1) ================== */
-    mv_hum = ReadADC_Channel(PIN_HUMIDITE);
-    humidity = CAPTEURS_ComputeHumidity(mv_hum, AIR_VALUE_MV, WATER_VALUE_MV);
-
-    int h100 = (int)(humidity * 100.0f);
-    h_int = h100 / 100;
-
-
-    /* ============== TEMPERATURE sur Io35 (ADC1) (TMP235) ============== */
-    mv_temp = ReadADC_Channel(PIN_TEMPERATURE);
-    temperature = CAPTEURS_ComputeTemperature(mv_temp, V_OFFSET_MV);
-
-    int t100 = (int)(temperature * 100.0f);
-    t_int = t100 / 100;
-
-
-    // ===================== Filtrage numérique Temperature et Humidite =====================
-    /* Un filtrage logiciel par moyenne glissante permet de supprimer le bruit des capteurs
-    tout en conservant une information pertinente pour l’utilisateur, sans bloquer l’exécution du système. */
-    t_filt = filter_update(&temp_filter, t_int);
-    h_filt = filter_update(&hum_filter, h_int);
-  } // fin acquisition périodique
-
-
-  /* --- Température --- */
-  if (abs(t_filt - t_display) >= TEMP_DEADBAND)
-  {
-      t_display = t_filt;
-  }
-
-  /* --- Humidité --- */
-  if (abs(h_filt - h_display) >= HUM_DEADBAND)
-  {
-      h_display = h_filt;
-  }
-
-
-  // ===================== Asservissement de la Ventilation en Automatique =====================
-  // Le contrôle est actif seulement si on n'est pas sur la Page 4 (Mode Manuel)
-  if (Var_page != 4)
-  {
-	  if (temperature >= seuil_temperature)
-	  {
-          Motor_On();
-	  } else if (temperature < (seuil_temperature - 0.5f))
-		  // petite hysteresis pour éviter que
-		  // le ventilateur démmarre et s'arrête en permanence quand temperature oscille sur seuil_temperature
-	  {
-	  	  Motor_Off();
-	  }
-
-  // ===================== Asservissement de la Pompe en Automatique =====================
-
-	  // Asservissement linéaire
-	  //Plus l'humidité est éloignée de sa consigne, plus la pompe tourne à haute vitesse
-	  //Plus l'humidité s'approche de sa valeur consigne, moins la pompe tourne
-
-	  // Calcul du ratio humidité courante / consigne pour la loi PWM
-	  // Sécurité V2 : une consigne à 0 % donnerait une division par 0 -> ratio infini -> pompe arrêtée
-	  float humidity_ratio = (seuil_humidite > 0) ? (humidity / (float)seuil_humidite) : 1000.0f;
-
-	  // Application de l'équation de droite
-	  if (humidity_ratio <= ramp_x1) // Zone 1 : Besoin critique (100% PWM)
-	  {
-	      speed = 100;  // Vitesse max si humidity <= 0.55*seuil_humidite
-	  }
-	  else if (humidity_ratio <= ramp_x2) // Zone 2 : Régulation douce (Approche)
-	  {
-	      speed = (uint8_t)(m * humidity_ratio + b);  // Rampe linéaire
-	  }
-	  else // Zone 3 : Consigne atteinte
-	  {
-	      speed = 0;  // Pompe éteinte si humidity > 0.999*seuil_humidite
-	      Pump_Stop();
-	  }
-	  Pump_SetSpeed(speed);
-
-  } else {
-	  // Ne rien faire
-  }
-
-
-
-  // ===================== Changement de page si PB1 appuyé =====================
-  if (PB1_pressed)
-  {
-      PB1_pressed = false;       // on consomme l'événement
-
-      Var_page++;
-      if (Var_page > 5)
-          Var_page = 1;          // retour à la page 1
-  }
-
-
-  // ===================== Mise à jour du code erreur =====================
-  // V2 (correctif) : en V1 le code erreur n'était rafraîchi que sur la page 5.
-  // Sur la page 1, l'écran n'est redessiné que si lcd_state_t change : une erreur apparue
-  // avec des mesures stables (capteur débranché) ne provoquait donc jamais de redessin -> "OK" figé.
-  code_erreur = error_handler_has_error();
-
-  // ===================== Mise à jour de l'etat courant de la structure lcd_state_t =====================
-  lcd_curr.page = Var_page;
-  lcd_curr.t_filt = t_display;
-  lcd_curr.h_filt = h_display;
-  lcd_curr.seuil_temperature = seuil_temperature;
-  lcd_curr.seuil_humidite = seuil_humidite;
-  lcd_curr.code_erreur = code_erreur;
-  lcd_curr.pump_on = Pump_IsOn();
-  lcd_curr.fan_on = Motor_IsOn();
-
-
-
-
-  // ===================== Gestion de l'affichage (500ms) =====================
-  // Boucle principale de l'affichage LCD
-
-  // Le rafraîchissement est cadencé pour éviter les scintillements de l'écran
-  if ((now - last_lcd_update) >= LCD_REFRESH_MS)   // 500 ms = confort visuel
-      {
-          last_lcd_update = now;
-
-          // ===================== Mise à jour de l'écran LCD uniquement sur évênement =====================
-          // On compare l'état actuel (lcd_curr) avec l'état précédent (lcd_prev)
-          switch (Var_page)
-          {
-          case 1:
-        	  // -------- PAGE 1 --------
-        	  // Temperature     x°C
-        	  // Humidite        x%
-
-        	  lcd_page_1(&lcd_curr, &lcd_prev);
-
-             break;
-
-          case 2:
-        	  // -------- PAGE 2 --------
-        	  // Temperature     x°C
-        	  // Seuil           x°C -- limité 0 -> 51°C
-
-        		  if (PB2_pressed && !PB3_pressed)
-        		 {
-        		  PB2_pressed = false;       // on consomme l'événement
-        		  if (seuil_temperature < 51) seuil_temperature  += 1;// + 1
-        		 }
-        		 if (PB3_pressed && !PB2_pressed)
-        		 {
-        		  PB3_pressed = false;       // on consomme l'événement
-        		  if (seuil_temperature > 0) seuil_temperature -= 1; // - 1
-        		 }
-        	  lcd_page_2(&lcd_curr, &lcd_prev);
-
-             break;
-
-          case 3:
-        	  // -------- PAGE 3 --------
-        	  // Humidite        x%
-        	  // Seuil           x% -- limité 0 -> 100%
-
-        	  if (PB2_pressed && !PB3_pressed )
-        	  {
-        		  PB2_pressed = false;       // on consomme l'événement
-        		  if (seuil_humidite < 100) seuil_humidite += 1; // +1
-        	  }
-        	  if (PB3_pressed && !PB2_pressed )
-        	  {
-        		  PB3_pressed = false;       // on consomme l'événement
-        		  if (seuil_humidite > 0) seuil_humidite -= 1; // -1
-        	  }
-
-        	  lcd_page_3(&lcd_curr, &lcd_prev);
-
-             break;
-
-          case 4:
-        	  // -------- PAGE 4 --------
-        	  // Pompe       ON/OFF
-        	  // Ventilateur ON/OFF
-
-        	  // ===================== Ventilateur Manuel=====================
-        	  if (PB2_pressed)
-        	  {
-        		  PB2_pressed = false;   // On remet PB à false
-        		  if (Motor_IsOn()) // si le moteur est déjà allumé on l'éteind
-        			  Motor_Off();
-        		  else				// si le moteur est éteind on l'allume
-        			  Motor_On();
-        	  }
-
-        	  // ===================== Pompe Manuelle=====================
-        	  if (PB3_pressed)
-        	  {
-        		  PB3_pressed = false;   // On remet PB à false
-        		  if (Pump_IsOn())		// si la pompe est déjà allumé on l'éteind
-        			  Pump_Stop();
-        		  else
-        			  Pump_SetSpeed(100);   // si la pompe est éteinte on l'allume à 100% PWM
-        	  }
-
-        	  lcd_page_4(&lcd_curr, &lcd_prev);
-
-             break;
-
-          case 5:
-          	  // -------- PAGE 5 -------- MAINTENANCE
-  			// SYSTEME OK
-  			// FAN SYSTEM OK/KO
-  			// PUMP SYSTEM OK/KO
-        	  	  // code_erreur est mis à jour à chaque tour de boucle (cf. correctif V2 ci-dessus)
-          	      lcd_page_5(&lcd_curr, &lcd_prev);
-
-          	 break;
-
-          }
-      }
-
-  //Gestion des erreurs
-  error_handler_update(
-      t_filt,
-      h_filt,
-	  seuil_temperature,
-	  seuil_humidite,
-      Motor_IsOn(),
-      Pump_IsOn(),
-      now
-  );
-
-#if GREENHV2_DEBUG
-  // Pour le debug : tensions brutes et valeurs calculées (étalonnage V_OFFSET / AIR / WATER)
-  static uint32_t last_debug = 0;
-  if ((now - last_debug) >= DEBUG_PERIOD_MS)
-  {
-      last_debug = now;
-      Serial.printf("T: %lu mV -> %d C (filt %d) | H: %lu mV -> %d %% (filt %d, LCD %d) | Err: %d\r\n",
-                    (unsigned long)mv_temp, t_int, t_filt, (unsigned long)mv_hum, h_int, h_filt, h_display,
-                    error_handler_has_error());
-  }
+#if RT_STIMULUS
+  // Banc de stimulation pour les mesures WCET (étape 6) - priorité 1 : ne perturbe pas les tâches mesurées
+  xTaskCreatePinnedToCore(T_STIM, "T_STIM", 2048, NULL, 1, NULL, RT_CORE);
 #endif
 }
 
+
+/* ======================================================================== */
+/*         LOOP : la super-boucle est remplacée par les tâches FreeRTOS      */
+/* ======================================================================== */
+void loop()
+{
+  // loopTask n'a plus de rôle : on la supprime pour libérer sa pile et le cœur 1
+  vTaskDelete(NULL);
+}
+
+
+/* ======================================================================== */
+/*                  T_ACQ - Acquisition (périodique 100 ms, prio 6)          */
+/* ======================================================================== */
+// Priorité maximale : seule tâche avec une contrainte de gigue (SR-GH-021).
+// Elle ne prend jamais le mutex et n'est jamais bloquée en envoi (délai 0) :
+// rien d'autre qu'une interruption ne peut retarder son démarrage.
+static void T_ACQ(void *pvParameters)
+{
+  (void)pvParameters;
+  esp_task_wdt_add(NULL);   // surveillance par le chien de garde
+
+  //Moyenne glissante sur 8 échantillons pour stabiliser l'affichage sur le LCD
+  moving_avg_filter_t temp_filter;
+  moving_avg_filter_t hum_filter;
+  filter_init(&temp_filter, FILTER_SIZE, SEUIL_TEMPERATURE_DEFAUT); //init du filtre au seuil_temperature
+  filter_init(&hum_filter,  FILTER_SIZE, SEUIL_HUMIDITE_DEFAUT);    //init du filtre au seuil humidite
+
+  TickType_t last_wake = xTaskGetTickCount();   // date de référence de la période
+
+  for (;;)
+  {
+    rt_trace_activation(RT_TASK_ACQ, ACQ_PERIOD_MS * 1000UL);
+    uint32_t t0 = rt_trace_begin(RT_TASK_ACQ);
+
+    reg_event_t evt;
+    evt.type = EVT_MESURE;
+
+    /* ================== HUMIDITE sur Io34 (ADC1) ================== */
+    uint32_t mv_hum = CAPTEURS_ReadMilliVolts(PIN_HUMIDITE, ADC_OVERSAMPLING);
+    evt.humidity = CAPTEURS_ComputeHumidity(mv_hum, AIR_VALUE_MV, WATER_VALUE_MV);
+
+    /* ============== TEMPERATURE sur Io35 (ADC1) (TMP235) ============== */
+    uint32_t mv_temp = CAPTEURS_ReadMilliVolts(PIN_TEMPERATURE, ADC_OVERSAMPLING);
+    evt.temperature = CAPTEURS_ComputeTemperature(mv_temp, V_OFFSET_MV);
+
+    // ===================== Filtrage numérique Temperature et Humidite =====================
+    // Conversion en entier par troncature comme en V1, puis moyenne glissante
+    evt.t_filt = filter_update(&temp_filter, (int)evt.temperature);
+    evt.h_filt = filter_update(&hum_filter,  (int)evt.humidity);
+
+    // ===================== Publication vers T_REG =====================
+    // Délai 0 : T_ACQ n'attend jamais. T_REG (prio 5) vide la file juste après.
+    if (xQueueSend(q_reg, &evt, 0) != pdTRUE)
+    {
+      rt_trace_queue_full();
+    }
+
+    rt_trace_end(RT_TASK_ACQ, t0);
+    esp_task_wdt_reset();
+
+    // Attente de la prochaine période : réveil calculé depuis le réveil précédent (pas de dérive)
+    vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(ACQ_PERIOD_MS));
+  }
+}
+
+
+/* ======================================================================== */
+/*            T_REG - Régulation (sur événement q_reg, prio 5)               */
+/* ======================================================================== */
+// Seule tâche qui commande les actionneurs (principe du gardien) :
+// mode automatique, mode manuel (page 4) et mise en sécurité (SR-GH-031).
+static void T_REG(void *pvParameters)
+{
+  (void)pvParameters;
+  esp_task_wdt_add(NULL);
+
+  reg_event_t last_mesure = {};
+  bool mesure_valide = false;   // on ne régule pas tant qu'aucune mesure n'est arrivée
+
+  for (;;)
+  {
+    reg_event_t evt;
+    if (xQueueReceive(q_reg, &evt, pdMS_TO_TICKS(REG_WAIT_MS)) == pdTRUE)
+    {
+      uint32_t t0 = rt_trace_begin(RT_TASK_REG);
+
+      // ===================== Nouvelle mesure : publication pour les autres tâches =====================
+      if (evt.type == EVT_MESURE)
+      {
+        last_mesure = evt;
+        mesure_valide = true;
+        shared_data_set_mesures(evt.temperature, evt.humidity, evt.t_filt, evt.h_filt);
+      }
+
+      // ===================== Préparation des entrées de la régulation =====================
+      greenhouse_data_t d;
+      if (mesure_valide && shared_data_get(&d))
+      {
+        regulation_input_t in;
+        in.temperature       = last_mesure.temperature;   // valeur non filtrée (comme en V1)
+        in.humidity          = last_mesure.humidity;
+        in.seuil_temperature = d.seuil_temperature;
+        in.seuil_humidite    = d.seuil_humidite;
+        in.manual_mode       = (d.page == PAGE_MANUEL);  // régulation auto suspendue sur la page 4
+        in.manual_fan        = d.manual_fan;
+        in.manual_pump       = d.manual_pump;
+        in.pump_fault        = (d.code_erreur == 2 || d.code_erreur == 3);
+        in.temp_sensor_fault = d.temp_sensor_fault;
+
+        // ===================== Calcul et application des commandes =====================
+        Regulation_Step(&in);
+
+        // Publication de l'état réel des actionneurs (affichage, diagnostic, mode manuel)
+        bool fan_on  = (Motor_IsOn() != 0);
+        bool pump_on = Pump_IsOn();
+        shared_data_set_actionneurs(fan_on, pump_on);
+
+        // Changement d'état d'un actionneur : l'écran (page 4) est mis à jour sans attendre
+        if (fan_on != d.fan_on || pump_on != d.pump_on)
+        {
+          xSemaphoreGive(sem_lcd);
+        }
+      }
+
+      rt_trace_end(RT_TASK_REG, t0);
+    }
+    esp_task_wdt_reset();
+  }
+}
+
+
+/* ======================================================================== */
+/*           T_IHM - Boutons (sur événement q_boutons, prio 4)               */
+/* ======================================================================== */
+// Chaque appui est traité immédiatement dans le contexte de la page active :
+// un appui sans effet sur la page courante est consommé et oublié (SR-GH-025).
+static void T_IHM(void *pvParameters)
+{
+  (void)pvParameters;
+  esp_task_wdt_add(NULL);
+
+  for (;;)
+  {
+    button_event_t btn;
+    if (xQueueReceive(q_boutons, &btn, pdMS_TO_TICKS(IHM_WAIT_MS)) == pdTRUE)
+    {
+      uint32_t t0 = rt_trace_begin(RT_TASK_IHM);
+
+      greenhouse_data_t d;
+      if (shared_data_get(&d))
+      {
+        int  page        = d.page;
+        int  seuil_t     = d.seuil_temperature;
+        int  seuil_h     = d.seuil_humidite;
+        bool manual_fan  = d.manual_fan;
+        bool manual_pump = d.manual_pump;
+        bool commande    = false;     // true -> réveiller T_REG immédiatement
+
+        switch (btn.id)
+        {
+        // ===================== PB1 : Changement de page =====================
+        case BTN_PB1:
+          page++;
+          if (page > NB_PAGES)
+            page = 1;                 // retour à la page 1
+
+          if (page == PAGE_MANUEL)
+          {
+            // Entrée en mode manuel : les actionneurs gardent leur état courant (comme en V1)
+            manual_fan  = d.fan_on;
+            manual_pump = d.pump_on;
+          }
+          // Entrée ou sortie de la page 4 : la régulation doit changer de mode sans attendre
+          commande = (page == PAGE_MANUEL) || (d.page == PAGE_MANUEL);
+          break;
+
+        // ===================== PB2 : + consigne ou Ventilateur manuel =====================
+        case BTN_PB2:
+          if (page == 2 && seuil_t < SEUIL_T_MAX) seuil_t += 1;       // Seuil température +1 (0 -> 51°C)
+          else if (page == 3 && seuil_h < SEUIL_H_MAX) seuil_h += 1;  // Seuil humidité +1 (0 -> 100%)
+          else if (page == PAGE_MANUEL)
+          {
+            manual_fan = !d.fan_on;   // si le moteur est allumé on l'éteint, et inversement
+            commande = true;
+          }
+          break;
+
+        // ===================== PB3 : - consigne ou Pompe manuelle =====================
+        case BTN_PB3:
+          if (page == 2 && seuil_t > 0) seuil_t -= 1;                 // Seuil température -1
+          else if (page == 3 && seuil_h > 0) seuil_h -= 1;            // Seuil humidité -1
+          else if (page == PAGE_MANUEL)
+          {
+            manual_pump = !d.pump_on; // si la pompe est allumée on l'éteint, sinon 100% PWM
+            commande = true;
+          }
+          break;
+
+        default:
+          break;
+        }
+
+        shared_data_set_ihm(page, seuil_t, seuil_h, manual_fan, manual_pump);
+
+        // Réveil immédiat de T_REG (prio 5 > 4 : elle préempte T_IHM dès l'envoi)
+        if (commande)
+        {
+          reg_event_t evt = {};
+          evt.type = EVT_COMMANDE;
+          if (xQueueSend(q_reg, &evt, 0) != pdTRUE) rt_trace_queue_full();
+        }
+
+        rt_trace_press(btn.t_us);   // latence appui -> prise en compte
+
+        // Demande de redessin immédiat de l'écran (sémaphore binaire : synchronisation)
+        xSemaphoreGive(sem_lcd);
+      }
+
+      rt_trace_end(RT_TASK_IHM, t0);
+    }
+    esp_task_wdt_reset();
+  }
+}
+
+
+/* ======================================================================== */
+/*          T_LCD - Affichage (sem_lcd ou 500 ms, prio 3)                    */
+/* ======================================================================== */
+// Seule tâche qui accède à l'écran (gardien du bus I2C) : aucun mutex nécessaire sur l'I2C.
+// Elle copie un instantané des données sous mutex, rend le mutex, PUIS dessine (~35 ms).
+static void T_LCD(void *pvParameters)
+{
+  (void)pvParameters;
+  esp_task_wdt_add(NULL);
+
+  // Message de démarrage affiché par setup() : on attend SPLASH_MS avant le 1er redessin.
+  // Seule T_LCD attend : l'acquisition et la régulation démarrent immédiatement (pas de delay() bloquant dans setup).
+  // vTaskDelay rend le processeur aux autres tâches ; 2 s < 5 s du chien de garde.
+  vTaskDelay(pdMS_TO_TICKS(SPLASH_MS));
+  xSemaphoreGive(sem_lcd);      // 1er redessin immédiatement à la fin du message (sans attendre 500 ms)
+
+  static lcd_state_t lcd_prev = {};
+  static lcd_state_t lcd_curr = {};
+
+  //- Bande morte pour éviter le clear intempestif du LCD --//
+  int t_display = 0; // température affichée
+  int h_display = 0; // humidité affichée
+
+  for (;;)
+  {
+    // Réveil sur demande (appui bouton, changement de diagnostic) ou au plus tard toutes les 500 ms
+    BaseType_t sur_demande = xSemaphoreTake(sem_lcd, pdMS_TO_TICKS(LCD_REFRESH_MS));
+
+    uint32_t t0 = rt_trace_begin(RT_TASK_LCD);
+
+    greenhouse_data_t d;
+    if (shared_data_get(&d))
+    {
+      /* --- Température --- */
+      if (abs(d.t_filt - t_display) >= TEMP_DEADBAND)
+      {
+          t_display = d.t_filt;
+      }
+
+      /* --- Humidité --- */
+      if (abs(d.h_filt - h_display) >= HUM_DEADBAND)
+      {
+          h_display = d.h_filt;
+      }
+
+      // ===================== Mise à jour de l'etat courant de la structure lcd_state_t =====================
+      lcd_curr.page = d.page;
+      lcd_curr.t_filt = t_display;
+      lcd_curr.h_filt = h_display;
+      lcd_curr.seuil_temperature = d.seuil_temperature;
+      lcd_curr.seuil_humidite = d.seuil_humidite;
+      lcd_curr.code_erreur = d.code_erreur;
+      lcd_curr.pump_on = d.pump_on;
+      lcd_curr.fan_on = d.fan_on;
+
+      // ===================== Mise à jour de l'écran LCD uniquement sur évênement =====================
+      // On compare l'état actuel (lcd_curr) avec l'état précédent (lcd_prev)
+      switch (d.page)
+      {
+      case 1: lcd_page_1(&lcd_curr, &lcd_prev); break;   // Temperature / Humidite + OK
+      case 2: lcd_page_2(&lcd_curr, &lcd_prev); break;   // Temperature / Seuil
+      case 3: lcd_page_3(&lcd_curr, &lcd_prev); break;   // Humidite / Seuil
+      case 4: lcd_page_4(&lcd_curr, &lcd_prev); break;   // Pompe / Ventilateur ON/OFF
+      case 5: lcd_page_5(&lcd_curr, &lcd_prev); break;   // Maintenance
+      default: break;
+      }
+
+      if (sur_demande == pdTRUE) rt_trace_screen();     // latence appui -> écran à jour
+    }
+
+    rt_trace_end(RT_TASK_LCD, t0);
+    esp_task_wdt_reset();
+  }
+}
+
+
+/* ======================================================================== */
+/*            T_DIAG - Diagnostic (périodique 500 ms, prio 2)                */
+/* ======================================================================== */
+// Seule tâche qui utilise l'error_handler. Elle publie le code erreur dans les données
+// partagées : T_REG l'utilise pour la mise en sécurité, T_LCD pour l'affichage.
+static void T_DIAG(void *pvParameters)
+{
+  (void)pvParameters;
+  esp_task_wdt_add(NULL);
+
+  int code_precedent = 0;
+  TickType_t last_wake = xTaskGetTickCount();
+
+  for (;;)
+  {
+    uint32_t t0 = rt_trace_begin(RT_TASK_DIAG);
+
+    greenhouse_data_t d;
+    if (shared_data_get(&d))
+    {
+      //Gestion des erreurs
+      error_handler_update(
+          d.t_filt,
+          d.h_filt,
+          d.seuil_temperature,
+          d.seuil_humidite,
+          d.fan_on,
+          d.pump_on,
+          millis()
+      );
+
+      int code = error_handler_has_error();
+      shared_data_set_diag(code, error_handler_temp_sensor_fault());
+
+      // Changement d'état du diagnostic : l'écran est mis à jour sans attendre (page 1 / page 5)
+      if (code != code_precedent)
+      {
+        code_precedent = code;
+        xSemaphoreGive(sem_lcd);
+      }
+    }
+
+    rt_trace_end(RT_TASK_DIAG, t0);
+
+#if RT_TRACE
+    // Rapport de mesures (hors mesure de T_DIAG) + marge de pile de chaque tâche (octets)
+    rt_trace_report();
+    static uint32_t last_stack_ms = 0;
+    if ((millis() - last_stack_ms) >= RT_TRACE_REPORT_MS)
+    {
+      last_stack_ms = millis();
+      Serial.printf("Pile libre min (o) : ACQ %u | REG %u | IHM %u | LCD %u | DIAG %u\r\n",
+                    (unsigned)uxTaskGetStackHighWaterMark(h_acq), (unsigned)uxTaskGetStackHighWaterMark(h_reg),
+                    (unsigned)uxTaskGetStackHighWaterMark(h_ihm), (unsigned)uxTaskGetStackHighWaterMark(h_lcd),
+                    (unsigned)uxTaskGetStackHighWaterMark(h_diag));
+    }
+#endif
+
+    esp_task_wdt_reset();
+
+    ////////////////////-----------------Test E6 a commenter en operationel-----------------////////////////////
+    /*static int essai_wdt = 0;
+    if (++essai_wdt == 20) { vTaskDelay(pdMS_TO_TICKS(8000)); }   // TEST WDT : blocage 8 s après ~10 s*/
+    ////////////////////-----------------Test E6 a commenter en operationel-----------------////////////////////
+
+    vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(DIAG_PERIOD_MS));
+  }
+}
+
+
+#if RT_STIMULUS
+/* ======================================================================== */
+/*      T_STIM - Banc de stimulation (mesures WCET uniquement, prio 1)       */
+/* ======================================================================== */
+// Injecte un appui PB1 toutes les RT_STIMULUS_MS dans q_boutons, comme le ferait l'ISR.
+// Chaque appui change de page : T_IHM s'exécute, T_LCD fait un redessin complet (pire cas)
+// et T_REG est réveillée à l'entrée et à la sortie de la page 4.
+// Permet d'atteindre 1000 activations de T_IHM et T_LCD sans appuyer 1000 fois.
+// Remarque : la latence mesurée part de l'injection (l'ISR n'est pas comprise).
+static void T_STIM(void *pvParameters)
+{
+  (void)pvParameters;
+  vTaskDelay(pdMS_TO_TICKS(3000));   // laisse le système démarrer
+  TickType_t last_wake = xTaskGetTickCount();
+  for (;;)
+  {
+    button_event_t evt = { BTN_PB1, (uint32_t)esp_timer_get_time() };
+    xQueueSend(q_boutons, &evt, 0);
+    vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(RT_STIMULUS_MS));
+  }
+}
+#endif
 
 /* ======================================================================== */
 /*                            FONCTIONS LOCALES                             */
 /* ======================================================================== */
 
-/* Lecture d un canal ADC1 par polling, retourne la tension en mV */
-// Pas besoin d'interruption pour l'ADC car les mesures sont lentes (température et humidité)
-// V2 : analogReadMilliVolts() applique la courbe d'étalonnage usine (eFuse) de l'ADC ESP32
-// Sur-échantillonnage : moyenne de ADC_OVERSAMPLING conversions pour réduire le bruit de l'ADC
-uint32_t ReadADC_Channel(uint8_t pin)
+// Configuration du Task Watchdog Timer d'ESP-IDF (SR-GH-030)
+// Délai 5 s, redémarrage (panic) si une tâche surveillée ne s'est pas signalée.
+// Les tâches IDLE des 2 cœurs sont aussi surveillées : si nos tâches monopolisaient
+// le cœur 1 pendant 5 s (surcharge), le chien de garde le détecterait.
+static void Watchdog_Init(void)
 {
-    uint32_t sum = 0;
-    for (int i = 0; i < ADC_OVERSAMPLING; i++)
-    {
-        sum += analogReadMilliVolts(pin);
-    }
-    return sum / ADC_OVERSAMPLING;   // tension moyenne en mV
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  esp_task_wdt_config_t cfg;
+  cfg.timeout_ms     = WDT_TIMEOUT_MS;
+  cfg.idle_core_mask = (1 << 0) | (1 << 1);
+  cfg.trigger_panic  = true;
+  if (esp_task_wdt_reconfigure(&cfg) != ESP_OK)   // déjà initialisé par le core Arduino
+  {
+    esp_task_wdt_init(&cfg);                      // sinon initialisation
+  }
+#else
+  esp_task_wdt_init(WDT_TIMEOUT_MS / 1000, true);
+  esp_task_wdt_add(xTaskGetIdleTaskHandleForCPU(0));
+  esp_task_wdt_add(xTaskGetIdleTaskHandleForCPU(1));
+#endif
 }
 
-// Configuration des boutons poussoirs et des interruptions (équivalent EXTI V1)
-static void Buttons_Init(void)
+// Erreur d'initialisation : message sur le LCD et arrêt (le chien de garde n'est pas encore actif)
+static void Fatal_Error(const char *msg)
 {
-    // Boutons actifs à l'état bas : pull-up interne
-    pinMode(PIN_PB1, INPUT_PULLUP);
-    pinMode(PIN_PB2, INPUT_PULLUP);
-    pinMode(PIN_PB3, INPUT_PULLUP);
-
-    // Interruption sur front montant comme en V1 (HAL_GPIO_EXTI_Rising_Callback)
-    // -> avec un pull-up, l'événement est généré au relâchement du bouton
-    attachInterrupt(digitalPinToInterrupt(PIN_PB1), PB1_ISR, RISING);
-    attachInterrupt(digitalPinToInterrupt(PIN_PB2), PB2_ISR, RISING);
-    attachInterrupt(digitalPinToInterrupt(PIN_PB3), PB3_ISR, RISING);
-}
-
-// Interruption
-// Anti-rebond logiciel : On ignore les impulsions parasites < 200ms
-// générées par le contact mécanique des boutons (horodatage commun aux 3 boutons, comme en V1)
-static volatile uint32_t last_interrupt_time = 0;
-
-static bool IRAM_ATTR debounce_ok(void)
-{
-    uint32_t now = millis();
-    if (now - last_interrupt_time < DEBOUNCE_MS) return false;  // 200 ms debounce
-    last_interrupt_time = now;
-    return true;
-}
-
-// IRAM_ATTR : la routine est placée en RAM interne (exécutable même pendant un accès flash)
-void IRAM_ATTR PB1_ISR(void)
-{
-    if (debounce_ok()) PB1_pressed = true;   // Flag PB1
-}
-
-void IRAM_ATTR PB2_ISR(void)
-{
-    if (debounce_ok()) PB2_pressed = true;   // Flag PB2
-}
-
-void IRAM_ATTR PB3_ISR(void)
-{
-    if (debounce_ok()) PB3_pressed = true;   // Flag PB3
+  Motor_Off();
+  Pump_Stop();
+  lcd_clear();
+  lcd_position_cursor(0, 0);
+  lcd_show_txt("ERREUR INIT");
+  lcd_position_cursor(0, 1);
+  lcd_show_txt(msg);
+  for (;;) { delay(1000); }
 }

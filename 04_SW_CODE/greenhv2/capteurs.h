@@ -36,4 +36,13 @@ float CAPTEURS_ComputeTemperature(uint32_t voltage_mv, float v_offset_mv);
  */
 float CAPTEURS_ComputeHumidity(uint32_t voltage_mv, float air_mv, float water_mv);
 
+/**
+ * @brief Lecture d'une entrée analogique en mV avec sur-échantillonnage
+ * @param pin       : broche ADC1
+ * @param n_samples : nombre de conversions moyennées
+ * @return          : tension moyenne en mV
+ * (déplacée depuis le .ino : ReadADC_Channel en V1 / v2.0)
+ */
+uint32_t CAPTEURS_ReadMilliVolts(uint8_t pin, int n_samples);
+
 #endif // CAPTEURS_H
