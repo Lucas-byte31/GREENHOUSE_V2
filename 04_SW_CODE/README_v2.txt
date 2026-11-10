@@ -11,33 +11,39 @@ via des lois de commande Tout-Ou-Rien (avec hystérésis) et Proportionnelle (PW
 La V2 porte la V1 (STM32G031 / STM32CubeIDE) sur ESP32 (Arduino IDE) puis introduit
 le temps réel avec FreeRTOS (cf. 02_SW_SPEC/System_spec_v2.docx).
 
-2. ARCHITECTURE LOGICIELLE (greenhv2/)
+2. ARCHITECTURE LOGICIELLE (greenhv2/) - V2.1 FreeRTOS
 ---------------------------------------------
+Conception détaillée : 02_SW_SPEC/Conception_TR_v2.md
 
-[Cœur du système]
-- greenhv2.ino          : Séquence d'initialisation (setup) et boucle principale (loop).
-                          Remplace main.c. Gestion des interruptions des boutons.
-- greenhv2.h            : Mapping GPIO ESP32 et structure lcd_state_t (ex main.h).
-- error_handler.cpp/.h  : Diagnostic fonctionnel. Détecte les pannes capteurs et
-                          actionneurs (consigne non rejointe en 15 s, valeurs aberrantes).
+[Cœur du système - temps réel]
+- greenhv2.ino          : Séquenceur. setup() crée les objets FreeRTOS et 5 tâches
+                          épinglées sur le cœur 1 ; corps des tâches :
+                          T_ACQ (prio 6, 100 ms)  acquisition + filtrage
+                          T_REG (prio 5, événement) régulation, seule à piloter les actionneurs
+                          T_IHM (prio 4, événement) traitement des appuis boutons
+                          T_LCD (prio 3, 500 ms ou sur demande) seule à piloter l'écran
+                          T_DIAG (prio 2, 500 ms) diagnostic
+                          Chien de garde des tâches (Task WDT, 5 s).
+- greenhv2.h            : Mapping GPIO ESP32, lcd_state_t, événements de régulation.
+- shared_data.cpp/.h    : Données partagées protégées par un mutex (héritage de priorité).
+- rt_trace.cpp/.h       : Instrumentation WCET (RT_TRACE = 1) : durées, gigue, latences.
+- error_handler.cpp/.h  : Diagnostic fonctionnel (consigne non rejointe en 15 s,
+                          sondes hors service). Utilisé par T_DIAG uniquement.
 
 [Traitement Capteurs]
-- capteurs.cpp/.h       : Fonctions de transfert (Lois physiques) pour convertir
-                          les tensions mesurées (mV) en °C et %.
-- filter.cpp/.h         : Algorithme de moyenne glissante pour stabiliser les
-                          mesures face au bruit électronique.
+- capteurs.cpp/.h       : Lecture ADC en mV (sur-échantillonnage) et fonctions de
+                          transfert (Lois physiques) en °C et %.
+- filter.cpp/.h         : Algorithme de moyenne glissante.
 
 [Interface Utilisateur (HMI)]
-- lcd.cpp/.h            : Driver LCD 2x16 I2C (PCF8574, adresse 0x27). Couche
-                          d'adaptation sur la librairie LCD_I2C (Blackhat) qui
-                          conserve l'API de la V1.
-- lcd_page_manager.cpp/.h : Logique de navigation entre les 5 pages (menus) du LCD
-                          et gestion du rafraîchissement optimisé de l'écran.
+- buttons.cpp/.h        : Interruptions boutons (anti-rebond par bouton) -> file q_boutons.
+- lcd.cpp/.h            : Driver LCD 2x16 I2C (PCF8574, 0x27) sur la librairie LCD_I2C.
+- lcd_page_manager.cpp/.h : Les 5 pages (menus) et le rafraîchissement optimisé.
 
 [Actionneurs]
+- regulation.cpp/.h     : Lois TOR (hystérésis) et PWM, mode manuel, mise en sécurité.
 - motor_driver_fan.cpp/.h  : Driver Pilotage du ventilateur (ON/OFF).
-- motor_driver_pump.cpp/.h : Driver Gestion de la pompe via signal PWM LEDC 20 kHz
-                          (Vitesse variable).
+- motor_driver_pump.cpp/.h : Driver Gestion de la pompe via signal PWM LEDC 20 kHz.
 
 3. LOGIQUES DE RÉGULATION
 -------------------------
@@ -58,11 +64,12 @@ le temps réel avec FreeRTOS (cf. 02_SW_SPEC/System_spec_v2.docx).
 
 5. ÉTALONNAGE
 -------------
-Passer GREENHV2_DEBUG à 1 dans greenhv2.ino, ouvrir le moniteur série (115200) :
+Version v2.0-migration : passer GREENHV2_DEBUG à 1 dans greenhv2.ino, moniteur série (115200) :
 - V_OFFSET_MV    : écart entre la température affichée et un thermomètre (x 10 mV/°C)
 - AIR_VALUE_MV   : tension du capteur d'humidité à l'air sec
 - WATER_VALUE_MV : tension du capteur d'humidité plongé dans l'eau
-Remettre GREENHV2_DEBUG à 0 ensuite.
+Remettre GREENHV2_DEBUG à 0 ensuite. (V2.1 : valeurs dans greenhv2.ino, rapport de mesures
+activé par RT_TRACE = 1 dans rt_trace.h.)
 
 6. HISTORIQUE
 -------------
@@ -73,4 +80,6 @@ Remettre GREENHV2_DEBUG à 0 ensuite.
          Correctifs V1 : code erreur rafraîchi à chaque tour (et plus seulement sur la page 5),
          détection de la sonde de température débranchée (T < -20 °C), cf. SR-GH-011 rév. 01.
          Consigne d'humidité par défaut : 5 % (V1 : 18 %), cf. SR-GH-007.
-- V2.1 : (à venir) découpage en tâches FreeRTOS, synchronisation, mesures WCET.
+- V2.1 : (branche feature/freertos) découpage en 5 tâches FreeRTOS sur le cœur 1,
+         mutex / sémaphore binaire / files, chien de garde, mise en sécurité (SR-GH-031),
+         boutons détectés à l'appui avec anti-rebond par bouton, instrumentation rt_trace.

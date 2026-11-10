@@ -12,6 +12,7 @@
  *    ou Capteur Humidité HS
  *
  * V2 : logique de détection V1 + borne basse de température (sonde débranchée, SR-GH-011 rév. 01).
+ *      Module appelé uniquement par la tâche T_DIAG (pas d'accès concurrent à son état interne).
  *      La LED de signalisation est supprimée (décision du 04/11/2026) :
  *      le défaut est signalé par le LCD uniquement (page 1 et page 5).
  *
@@ -68,8 +69,8 @@ void error_handler_update(int temp,
                           bool pump_on,
                           uint32_t now_ms)
 {
-    (void)fan_on;   // non utilisé en V1 - conservé pour l'évolution SR-GH-031
-    (void)pump_on;  // non utilisé en V1 - conservé pour l'évolution SR-GH-031
+    (void)fan_on;   // non utilisé (logique V1 conservée)
+    (void)pump_on;  // non utilisé (logique V1 conservée)
 
     /* ---------- Température ne baisse pas malgré la consigne---------- */
     	/* ---------- Capteur de température HS ( >80°C ou < -20°C )---------- */
@@ -111,4 +112,12 @@ int error_handler_has_error(void)
 	else if  (!temp_error && hum_error) error_code = 2;
 	else if  (temp_error && hum_error) error_code = 3;
     return (error_code);
+}
+
+// Sonde de température hors service confirmée (SR-GH-031)
+// L'erreur température est confirmée (15 s) ET la dernière valeur est hors de la plage physique
+// -> on distingue "sonde HS" (ventilateur forcé ON) de "consigne non rejointe".
+bool error_handler_temp_sensor_fault(void)
+{
+    return temp_error && (last_temp > TEMP_MAX_JUMP || last_temp < TEMP_MIN_VALID);
 }

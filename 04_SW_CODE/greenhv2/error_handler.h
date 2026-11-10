@@ -27,4 +27,7 @@ void error_handler_update(int temp,
 /* État global erreur */
 int error_handler_has_error(void);
 
+/* Sonde de température hors service confirmée (erreur température ET valeur hors [-20 ; 80] °C) */
+bool error_handler_temp_sensor_fault(void);
+
 #endif /* ERROR_HANDLER_H */
