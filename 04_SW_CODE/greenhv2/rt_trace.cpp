@@ -8,10 +8,10 @@
  * (portENTER_CRITICAL / spinlock) car ces fonctions peuvent être appelées depuis des
  * tâches de priorités différentes et le rapport doit lire des valeurs cohérentes.
  *
- * Attention à l'interprétation : la durée mesurée entre rt_trace_begin et rt_trace_end
+ * la durée mesurée entre rt_trace_begin et rt_trace_end
  * inclut les éventuelles préemptions par des tâches plus prioritaires. Pour T_ACQ
  * (priorité max) c'est directement son temps d'exécution C ; pour les autres tâches
- * c'est un temps de réponse depuis le démarrage, qui majore C (cf. démarche étape 6).
+ * c'est un temps de réponse depuis le démarrage, qui majore C.
  *
  *  Created on: Nov 4, 2026
  *      Author: lucas

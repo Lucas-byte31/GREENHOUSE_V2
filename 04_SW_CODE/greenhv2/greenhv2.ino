@@ -85,13 +85,16 @@
 #define PRIO_LCD         3
 #define PRIO_DIAG        2
 
-// Tailles de pile en octets (à ajuster avec uxTaskGetStackHighWaterMark à l'étape 6)
+// ailles de pile en octets, validées par uxTaskGetStackHighWaterMark (pile libre min ≥ 50 %, voir Mesures_WCET_v2.md)
 #define STACK_ACQ        3072
 #define STACK_REG        3072
 #define STACK_IHM        3072
 #define STACK_LCD        4096
 #define STACK_DIAG       4096
 
+// 1 mesure / 100 ms (T_ACQ) + commandes IHM. T_REG (prio 5) vide la file en < 0,1 ms,
+// il n'y a jamais plus d'un message en attente dnc 4 couvre une rafale mesure + 3 boutons.
+// Vérifié : compteur "File pleine" à 0 sur tous les essais E1 à E4.
 #define REG_QUEUE_LENGTH 4
 
 // Délais max d'attente des tâches événementielles : elles se réveillent toujours
@@ -156,7 +159,7 @@ void setup()
   error_handler_init(SEUIL_TEMPERATURE_DEFAUT, SEUIL_HUMIDITE_DEFAUT);
 
   // ===================== Création des objets de synchronisation =====================
-  // Ils doivent exister AVANT les tâches et les interruptions qui les utilisent
+  // Ils doivent exister Avantles tâches et les interruptions qui les utilisent
   if (!shared_data_init(SEUIL_TEMPERATURE_DEFAUT, SEUIL_HUMIDITE_DEFAUT)) Fatal_Error("mtx_data");
 
   q_boutons = xQueueCreate(BUTTONS_QUEUE_LENGTH, sizeof(button_event_t));
@@ -169,8 +172,8 @@ void setup()
 
   Watchdog_Init();
 
-  // ===================== Création des tâches, toutes épinglées sur le cœur 1 =====================
-  // Remarque : setup() tourne dans loopTask (prio 1) ; chaque tâche créée, plus prioritaire,
+  // ===================== Création des tâches toutes sur le cœur 1 =====================
+  // Remarque : setup() tourne dans loopTask (prio 1) et chaque tâche créée, plus prioritaire,
   // démarre immédiatement. Les objets RTOS étant déjà créés, l'ordre de création est sans risque.
   xTaskCreatePinnedToCore(T_DIAG, "T_DIAG", STACK_DIAG, NULL, PRIO_DIAG, &h_diag, RT_CORE);
   xTaskCreatePinnedToCore(T_LCD,  "T_LCD",  STACK_LCD,  NULL, PRIO_LCD,  &h_lcd,  RT_CORE);
@@ -180,7 +183,7 @@ void setup()
   if (!h_acq || !h_reg || !h_ihm || !h_lcd || !h_diag) Fatal_Error("creation taches");
 
 #if RT_STIMULUS
-  // Banc de stimulation pour les mesures WCET (étape 6) - priorité 1 : ne perturbe pas les tâches mesurées
+  // Banc de stimulation pour les mesures WCET - priorité 1 : ne perturbe pas les tâches mesurées
   xTaskCreatePinnedToCore(T_STIM, "T_STIM", 2048, NULL, 1, NULL, RT_CORE);
 #endif
 }
@@ -191,7 +194,7 @@ void setup()
 /* ======================================================================== */
 void loop()
 {
-  // loopTask n'a plus de rôle : on la supprime pour libérer sa pile et le cœur 1
+  // loopTask n'a plus de rôle je la supprime pour libérer sa pile et le coeur 1
   vTaskDelete(NULL);
 }
 
@@ -215,6 +218,7 @@ static void T_ACQ(void *pvParameters)
 
   TickType_t last_wake = xTaskGetTickCount();   // date de référence de la période
 
+  // boucle infinie de la tâche, bloquée à chaque tour en attente de son événement pareil que While(true)
   for (;;)
   {
     rt_trace_activation(RT_TASK_ACQ, ACQ_PERIOD_MS * 1000UL);
@@ -256,7 +260,7 @@ static void T_ACQ(void *pvParameters)
 /*            T_REG - Régulation (sur événement q_reg, prio 5)               */
 /* ======================================================================== */
 // Seule tâche qui commande les actionneurs (principe du gardien) :
-// mode automatique, mode manuel (page 4) et mise en sécurité (SR-GH-031).
+// mode automatique, mode manuel en page4 et mise en sécurité (SR-GH-031).
 static void T_REG(void *pvParameters)
 {
   (void)pvParameters;
@@ -265,6 +269,7 @@ static void T_REG(void *pvParameters)
   reg_event_t last_mesure = {};
   bool mesure_valide = false;   // on ne régule pas tant qu'aucune mesure n'est arrivée
 
+    // boucle infinie de la tâche, bloquée à chaque tour en attente de son événement pareil que While(true
   for (;;)
   {
     reg_event_t evt;
@@ -561,7 +566,7 @@ static void T_DIAG(void *pvParameters)
 /* ======================================================================== */
 /*      T_STIM - Banc de stimulation (mesures WCET uniquement, prio 1)       */
 /* ======================================================================== */
-// Injecte un appui PB1 toutes les RT_STIMULUS_MS dans q_boutons, comme le ferait l'ISR.
+// Injecte un appui PB1 toutes les RT_STIMULUS_MS dans q_boutons, comme le ferait la fonction d'interruption.
 // Chaque appui change de page : T_IHM s'exécute, T_LCD fait un redessin complet (pire cas)
 // et T_REG est réveillée à l'entrée et à la sortie de la page 4.
 // Permet d'atteindre 1000 activations de T_IHM et T_LCD sans appuyer 1000 fois.

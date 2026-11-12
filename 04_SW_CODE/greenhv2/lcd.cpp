@@ -6,7 +6,7 @@
  *
  * Remarque temps réel : la librairie attend la fin de chaque commande par
  * delayMicroseconds() (attente active) : ~1,6 ms pour un clear, ~40 µs par caractère
- * en plus de la trame I2C. Ces durées seront mesurées à l'étape WCET.
+ * en plus de la trame I2C.
  *
  *  Created on: Nov 4, 2026
  *      Author: lucas
